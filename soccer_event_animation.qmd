@@ -1,0 +1,787 @@
+---
+title: "Soccer Event Animation & STRAIN Analysis"
+format: html
+editor: visual
+---
+
+## Reading in the Data
+
+```{r}
+library(tidyverse)
+
+# data from https://github.com/metrica-sports/sample-data/tree/master/data
+
+# Read the data
+possession_data <- read.csv("Sample_Game_1_RawEventsData.csv")
+tracking_home   <- read_csv("Sample_Game_1_RawTrackingData_Home_Team.csv", skip = 2)
+tracking_away   <- read_csv("Sample_Game_1_RawTrackingData_Away_Team.csv", skip = 2)
+
+# Function to rename columns properly
+fix_tracking_columns <- function(df) {
+  cols     <- colnames(df)
+  new_cols <- cols
+
+  for (i in 1:(length(cols) - 1)) {
+    if (grepl("^Player\\d+$", cols[i])) {
+      new_cols[i]     <- paste0(cols[i], "_x")
+      new_cols[i + 1] <- paste0(cols[i], "_y")
+    } else if (cols[i] == "Ball") {
+      new_cols[i]     <- "Ball_x"
+      new_cols[i + 1] <- "Ball_y"
+    }
+  }
+
+  colnames(df) <- new_cols
+  return(df)
+}
+
+# Apply the fix
+tracking_home <- fix_tracking_columns(tracking_home)
+tracking_away <- fix_tracking_columns(tracking_away)
+
+# Reshape to long format
+tracking_home_long <- tracking_home %>%
+  pivot_longer(
+    cols         = matches("^Player\\d+_[xy]$"),
+    names_to     = c("player", "coord"),
+    names_pattern = "(Player\\d+)_([xy])"
+  ) %>%
+  pivot_wider(names_from = coord, values_from = value) %>%
+  mutate(team = "Home") %>%
+  rename(time = `Time [s]`)
+
+tracking_away_long <- tracking_away %>%
+  pivot_longer(
+    cols         = matches("^Player\\d+_[xy]$"),
+    names_to     = c("player", "coord"),
+    names_pattern = "(Player\\d+)_([xy])"
+  ) %>%
+  pivot_wider(names_from = coord, values_from = value) %>%
+  mutate(team = "Away") %>%
+  rename(time = `Time [s]`)
+
+# Combine and rescale coordinates to centred metres
+all_players <- bind_rows(tracking_home_long, tracking_away_long) %>%
+  select(-Ball_x, -Ball_y) %>%
+  mutate(
+    x = (x - 0.5) * 105,
+    y = (y - 0.5) * 68
+  )
+
+# Ball data
+ball_data <- tracking_home %>%
+  select(Period, Frame, time = `Time [s]`, Ball_x, Ball_y) %>%
+  mutate(
+    Ball_x = (Ball_x - 0.5) * 105,
+    Ball_y = (Ball_y - 0.5) * 68
+  )
+```
+
+## Visualization of Data
+
+```{r}
+library(gganimate)
+library(sportyR)
+
+# Soccer pitch via sportyR
+pitch <- geom_soccer(
+  league = "FIFA",
+  display_range = "full",
+  color_updates = list(
+    plot_background      = "#195905",
+    defensive_half_pitch = "#195905",
+    offensive_half_pitch = "#195905"
+  ),
+  rotation = 0
+)
+
+# Filter to first 30 seconds
+example_sequence <- all_players %>%
+  filter(Period == 1, time >= 0, time <= 30) %>%
+  drop_na(x, y) %>%
+  mutate(pt_color = ifelse(team == "Home", "#FF4444", "#4444FF"))
+
+ball_sequence <- ball_data %>%
+  filter(Period == 1, time >= 0, time <= 30)
+
+# Extract player number helper
+player_num <- function(p) sub("Player", "", p)
+
+# Build animation
+anim <- pitch +
+  geom_point(
+    data  = example_sequence,
+    aes(x = x, y = y, color = pt_color),
+    size  = 5, alpha = 0.8
+  ) +
+  geom_text(
+    data  = example_sequence,
+    aes(x = x, y = y, label = player_num(player)),
+    color = "white", size = 2.2, fontface = "bold"
+  ) +
+  geom_point(
+    data   = ball_sequence,
+    aes(x  = Ball_x, y = Ball_y),
+    color  = "white", size = 3,
+    shape  = 21, fill = "black", stroke = 2
+  ) +
+  scale_color_identity() +
+  transition_time(time) +
+  labs(
+    title    = "Time: {round(frame_time, 1)}s",
+    subtitle = "Red = Home | Blue = Away"
+  ) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12)
+  )
+
+# Render at 25 Hz (real-time speed)
+animate(
+  anim,
+  nframes  = length(unique(example_sequence$Frame)),
+  fps      = 25,
+  duration = 30,
+  width    = 800,
+  height   = 600,
+  renderer = gifski_renderer()
+)
+```
+
+## STRAIN Metric
+
+```{r}
+PITCH_LENGTH <- 105  # metres
+PITCH_WIDTH  <- 68   # metres
+
+# =============================================================================
+# Helper: Reshape wide tracking data to long format + rescale
+# =============================================================================
+
+parse_tracking <- function(tracking_raw, team_label) {
+
+  # Rename time column
+  tracking_raw <- tracking_raw %>% rename(time = `Time [s]`)
+
+  # Ball positions, rescaled
+  ball <- tracking_raw %>%
+    select(Period, Frame, time, Ball_x, Ball_y) %>%
+    mutate(
+      Ball_x = (Ball_x - 0.5) * PITCH_LENGTH,
+      Ball_y = (Ball_y - 0.5) * PITCH_WIDTH
+    )
+
+  # Player positions, long format
+  players <- tracking_raw %>%
+    select(Period, Frame, time, matches("^Player\\d+_[xy]$")) %>%
+    pivot_longer(
+      cols = matches("^Player\\d+_[xy]$"),
+      names_to = c("player", ".value"),
+      names_pattern = "^(Player\\d+)_(x|y)$"
+    ) %>%
+    filter(!is.na(x), !is.na(y)) %>%
+    mutate(
+      team = team_label,                 # keep team as separate column
+      x    = (x - 0.5) * PITCH_LENGTH,
+      y    = (y - 0.5) * PITCH_WIDTH
+    ) %>%
+    select(Period, Frame, time, team, player, x, y)  # team separate from player
+
+  list(players = players, ball = ball)
+}
+
+
+# =============================================================================
+# Helper: Frame-level possession from event data (LOCF)
+# =============================================================================
+# Each event covers Start.Frame:End.Frame.
+# Ball-carrier = To player if a recipient exists, else From player.
+# Gaps between events are filled via last-observation-carried-forward.
+
+build_event_possession <- function(possession_data, all_frames) {
+
+  event_frames <- possession_data %>%
+    filter(!is.na(Start.Frame), !is.na(End.Frame)) %>%
+    rowwise() %>%
+    mutate(Frame = list(seq(Start.Frame, End.Frame))) %>%
+    unnest(Frame) %>%
+    ungroup() %>%
+    mutate(
+      possession_team   = Team,
+      possession_player = if_else(!is.na(To) & To != "", To, From)
+    ) %>%
+    arrange(Frame, desc(Start.Frame)) %>%
+    distinct(Frame, .keep_all = TRUE) %>%
+    select(Frame, possession_team, possession_player)
+
+  all_frames %>%
+    select(Frame) %>%
+    distinct() %>%
+    arrange(Frame) %>%
+    left_join(event_frames, by = "Frame") %>%
+    tidyr::fill(possession_team, possession_player, .direction = "down") %>%
+    tidyr::fill(possession_team, possession_player, .direction = "up") %>%
+    mutate(
+      possession_source = if_else(
+        Frame %in% event_frames$Frame, "event", "interpolated"
+      )
+    )
+}
+
+# =============================================================================
+# Main: Calculate STRAIN
+# =============================================================================
+calculate_soccer_strain <- function(player_data,
+                                    ball_data,
+                                    possession_data,
+                                    goalkeeper = "Player11") {
+
+  # Infer attacking direction (unchanged)
+  attacking_direction <- player_data %>%
+    filter(player != goalkeeper) %>%
+    group_by(Period, team) %>%
+    summarise(mean_x = mean(x, na.rm = TRUE), .groups = "drop") %>%
+    group_by(Period) %>%
+    mutate(
+      away_mean_x        = mean_x[team == "Away"],
+      away_attacks_right = away_mean_x < 0,
+      attacks_right = case_when(
+        team == "Away" ~ away_attacks_right,
+        team == "Home" ~ !away_attacks_right,
+        TRUE ~ NA
+      )
+    ) %>%
+    ungroup() %>%
+    select(Period, team, attacks_right)
+
+  print(attacking_direction)
+
+  combined_data <- player_data %>%
+    filter(player != goalkeeper) %>%
+    inner_join(ball_data, by = c("Period", "Frame", "time")) %>%
+    mutate(distance_to_ball = sqrt((x - Ball_x)^2 + (y - Ball_y)^2))
+
+  all_frames <- combined_data %>% distinct(Frame, time, Period)
+
+  possession_by_frame <- build_event_possession(possession_data, all_frames)
+
+  # ── Build frame-level target player (ball carrier or pass recipient) ─────────
+  # For PASS events, the target is the "To" player during that event's frame range
+  # For all other events, the target is the "From" player
+  target_by_frame <- possession_data %>%
+    filter(!is.na(Start.Frame), !is.na(End.Frame)) %>%
+    rowwise() %>%
+    mutate(Frame = list(seq(Start.Frame, End.Frame))) %>%
+    unnest(Frame) %>%
+    ungroup() %>%
+    mutate(
+      target_player = case_when(
+        Type == "PASS" & !is.na(To) & To != "" ~ To,   # pass recipient
+        TRUE                                   ~ From   # ball carrier
+      )
+    ) %>%
+    arrange(Frame, desc(Start.Frame)) %>%
+    distinct(Frame, .keep_all = TRUE) %>%
+    select(Frame, target_player, possession_team = Team)
+
+  combined_with_possession <- combined_data %>%
+    inner_join(
+      possession_by_frame %>%
+        select(Frame, possession_team, possession_player, possession_source),
+      by = "Frame"
+    ) %>%
+    left_join(
+      attacking_direction %>%
+        rename(possession_team = team, poss_attacks_right = attacks_right),
+      by = c("Period", "possession_team")
+    ) %>%
+    # Join the target player for each frame
+    left_join(target_by_frame %>% select(Frame, target_player), by = "Frame") %>%
+    mutate(
+      is_defending = (team != possession_team),
+      ball_in_defensive_third = case_when(
+        poss_attacks_right  ~ Ball_x <= -17.5,
+        !poss_attacks_right ~ Ball_x >=  17.5,
+        TRUE ~ FALSE
+      ),
+      player_in_defensive_third = case_when(
+        poss_attacks_right  ~ x <= -17.5,
+        !poss_attacks_right ~ x >=  17.5,
+        TRUE ~ FALSE
+      )
+    )
+
+  # ── Get position of the target player (attacker with/receiving ball) per frame
+  target_positions <- combined_with_possession %>%
+    filter(!is.na(target_player)) %>%
+    # Match target_player name to player column — note possession_player uses
+    # the same naming convention as player (e.g. "Player1")
+    filter(player == target_player) %>%
+    select(Frame, time, target_x = x, target_y = y)
+
+  # ── Find closest DEFENDER to the target player each frame ────────────────────
+  defensive_players <- combined_with_possession %>%
+    filter(
+      is_defending              == TRUE,
+      ball_in_defensive_third   == TRUE,
+      player_in_defensive_third == TRUE
+    ) %>%
+    left_join(target_positions, by = c("Frame", "time")) %>%
+    filter(!is.na(target_x)) %>%
+    mutate(
+      distance_to_target = sqrt((x - target_x)^2 + (y - target_y)^2)
+    ) %>%
+    group_by(Frame, time) %>%
+    arrange(distance_to_target) %>%
+    slice(1) %>%
+    ungroup() %>%
+    arrange(time)
+
+  if (nrow(defensive_players) == 0) {
+    message("No frames matched — check attacking direction inference")
+    return(tibble())
+  }
+
+  strain_data <- defensive_players %>%
+    arrange(time) %>%
+    mutate(
+      time_diff       = time - lag(time),
+      distance_change = distance_to_target - lag(distance_to_target),
+      closure_rate = if_else(
+        !is.na(time_diff) &
+          time_diff > 0   &
+          time_diff <= 0.2 &
+          player == lag(player),
+        distance_change / time_diff,
+        NA_real_
+      ),
+      distance_safe = pmax(distance_to_target, 0.5),
+      strain_raw    = if_else(!is.na(closure_rate), -closure_rate / distance_safe, NA_real_),
+      STRAIN        = pmin(pmax(0, strain_raw, na.rm = TRUE), 10)
+    ) %>%
+    select(
+      Frame, time, Period,
+      possession_team, possession_player, possession_source,
+      target_player,
+      ball_in_defensive_third,
+      closest_defender = player,
+      defending_team   = team,
+      Ball_x, Ball_y,
+      defender_x  = x,       defender_y  = y,
+      target_x,              target_y,
+      distance_to_ball = distance_to_target,   # keep same name for downstream compat
+      closure_rate, STRAIN
+    )
+
+  return(strain_data)
+}
+
+# =============================================================================
+# Helper: Aggregate STRAIN over rolling time windows
+# =============================================================================
+
+aggregate_strain <- function(strain_data, window_seconds = 10) {
+  strain_data %>%
+    mutate(time_window = floor(time / window_seconds) * window_seconds) %>%
+    group_by(time_window, defending_team) %>%
+    summarise(
+      mean_STRAIN         = mean(STRAIN, na.rm = TRUE),
+      max_STRAIN          = max(STRAIN, na.rm = TRUE),
+      total_pressure_time = n(),
+      mean_distance       = mean(distance_to_ball, na.rm = TRUE),
+      mean_closure_rate   = mean(closure_rate, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+```
+
+```{r}
+# Parse tracking data
+home_parsed <- parse_tracking(tracking_home, team_label = "Home")
+away_parsed <- parse_tracking(tracking_away, team_label = "Away")
+
+strain_players <- bind_rows(home_parsed$players, away_parsed$players)
+strain_ball    <- home_parsed$ball   # ball is identical in both files
+
+# Run STRAIN
+strain_results <- calculate_soccer_strain(
+  player_data     = strain_players,
+  ball_data       = strain_ball,
+  possession_data = possession_data
+)
+
+# Possession source breakdown
+strain_results %>% count(closest_defender) 
+
+# Aggregate into 10-second windows
+strain_agg <- aggregate_strain(strain_results, window_seconds = 10)
+```
+
+## Metric Visualization
+
+```{r}
+# STRAIN over time by defending team
+ggplot(strain_agg, aes(x = time_window, y = mean_STRAIN, color = defending_team)) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  geom_smooth(se = FALSE, linewidth = 0.4, linetype = "dashed", alpha = 0.6) +
+  geom_vline(xintercept = 2700, color = "#94a3b8", linetype = "dotted", linewidth = 0.6) +
+  annotate(
+    "text",
+    x     = 2700,
+    y     = Inf,
+    label = "Halftime",
+    color = "#94a3b8",
+    size  = 3,
+    angle = 0,
+    hjust = -0.1,
+    vjust = 1.5,
+    family = "mono"
+  ) +
+  scale_color_manual(values = c("Home" = "#ef4444", "Away" = "#38bdf8")) +
+  scale_x_continuous(
+    labels = function(x) paste0(floor(x / 60), ":", sprintf("%02d", x %% 60))
+  ) +
+  labs(
+    title    = "Defensive STRAIN Over Time",
+    subtitle = "Mean STRAIN per 10-second window — attacking third only",
+    x        = "Match time (mm:ss)",
+    y        = "Mean STRAIN",
+    color    = "Defending team"
+  ) +
+  theme_minimal(base_family = "mono") +
+  theme(
+    plot.background  = element_rect(fill = "#020817", color = NA),
+    panel.background = element_rect(fill = "#0c1628", color = NA),
+    panel.grid.major = element_line(color = "#1e293b", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    panel.border     = element_rect(color = "#1e293b", fill = NA, linewidth = 0.5),
+    plot.title       = element_text(color = "#f8fafc", size = 16, face = "bold"),
+    plot.subtitle    = element_text(color = "#475569", size = 9),
+    axis.text        = element_text(color = "#64748b"),
+    axis.title       = element_text(color = "#475569"),
+    legend.background = element_rect(fill = "#0c1628", color = NA),
+    legend.text      = element_text(color = "#94a3b8"),
+    legend.title     = element_text(color = "#64748b"),
+    plot.margin      = margin(20, 24, 16, 20)
+  )
+```
+
+## Player Rankings
+
+```{r}
+# ============================================================================
+# Player-level STRAIN summary
+# ============================================================================
+
+player_pressure_summary <- strain_results %>%
+  group_by(closest_defender, defending_team) %>%
+  summarise(
+    total_frames      = n(),
+    mean_STRAIN       = mean(STRAIN, na.rm = TRUE),
+    max_STRAIN        = max(STRAIN, na.rm = TRUE),
+    mean_distance     = mean(distance_to_ball, na.rm = TRUE),
+    mean_closure_rate = mean(abs(closure_rate), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(player = closest_defender) %>%
+  arrange(desc(mean_STRAIN))
+
+print(player_pressure_summary)
+
+# ============================================================================
+# Visualization: Average STRAIN per player
+# ============================================================================
+
+plot_strain_by_player <- function(player_pressure_summary) {
+
+  team_avg <- mean(player_pressure_summary$mean_STRAIN, na.rm = TRUE)
+
+  plot_data <- player_pressure_summary %>%
+    arrange(desc(mean_STRAIN)) %>%
+    mutate(
+      player      = factor(player, levels = rev(player)),
+      strain_norm = (mean_STRAIN - min(mean_STRAIN)) /
+                    (max(mean_STRAIN) - min(mean_STRAIN))
+    )
+
+  # Top factor level = highest STRAIN player (sits at top of chart)
+  top_level <- levels(plot_data$player)[nlevels(plot_data$player)]
+
+  x_max <- max(player_pressure_summary$mean_STRAIN)
+  x_step <- if_else(x_max <= 2, 0.5, if_else(x_max <= 5, 1, 2))
+
+  ggplot(plot_data, aes(x = mean_STRAIN, y = player)) +
+
+    geom_vline(xintercept = seq(0, ceiling(x_max), by = x_step), color = "#1e293b", linewidth = 0.4) +
+
+    geom_vline(xintercept = team_avg, color = "#f97316", linewidth = 0.7, linetype = "dashed") +
+    # ✅ Use a factor level for y, NOT a number — prevents scale_y_continuous conflict
+    annotate(
+      "text",
+      x     = team_avg + 0.1,
+      y     = top_level,
+      label = paste0("Team avg: ", round(team_avg, 2)),
+      color = "#f97316", size = 3, hjust = 0, vjust = -0.8, family = "mono"
+    ) +
+
+    geom_col(aes(fill = strain_norm), width = 0.65, show.legend = FALSE) +
+
+    geom_text(
+      aes(label = round(mean_STRAIN, 2)),
+      hjust = -0.2, color = "#94a3b8", size = 3.2, family = "mono"
+    ) +
+
+    scale_fill_gradientn(colors = c("#38bdf8", "#f97316", "#ef4444"), limits = c(0, 1)) +
+
+    # ✅ No limits= here — use coord_cartesian instead to avoid clipping labels
+    scale_x_continuous(breaks = seq(0, ceiling(x_max), by = x_step), expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, max(player_pressure_summary$mean_STRAIN) * 1.25)) +
+
+    labs(
+      title    = "Average STRAIN Per Player",
+      subtitle = "Defensive pressure index (attacking third only) higher = more pressure applied",
+      x        = "Mean STRAIN",
+      y        = NULL
+    ) +
+
+    theme_minimal(base_family = "mono") +
+    theme(
+      plot.background  = element_rect(fill = "#020817", color = NA),
+      panel.background = element_rect(fill = "#0c1628", color = NA),
+      panel.grid       = element_blank(),
+      panel.border     = element_rect(color = "#1e293b", fill = NA, linewidth = 0.6),
+      axis.text.x      = element_text(color = "#475569", size = 9),
+      axis.text.y      = element_text(color = "#94a3b8", size = 10),
+      axis.title.x     = element_text(color = "#334155", size = 9, margin = margin(t = 10)),
+      axis.ticks       = element_blank(),
+      plot.title       = element_text(color = "#f8fafc", size = 20, face = "bold", margin = margin(b = 6)),
+      plot.subtitle    = element_text(color = "#475569", size = 9, margin = margin(b = 20)),
+      plot.margin      = margin(24, 32, 24, 24)
+    )
+}
+
+plot_strain_by_player(player_pressure_summary)
+```
+
+## Animated Visualization of Metric
+
+```{r}
+library(magick)
+library(patchwork)
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+ANIM_FPS      <- 10          # frames-per-second for both GIFs
+ANIM_DURATION <- 3          # seconds of match time to animate
+ANIM_PERIOD   <- 1           # which period to visualise
+TIME_START    <- 619
+TIME_END      <- TIME_START + ANIM_DURATION
+
+# ── 1. Identify the closest-defender player per frame from strain_results ──────
+#    strain_results already has closest_defender + Frame + time
+closest_def_lookup <- strain_results %>%
+  filter(Period == ANIM_PERIOD) %>%
+  select(Frame, closest_defender, defending_team)
+
+# ── 2. Player + ball slices for our window ────────────────────────────────────
+players_window <- all_players %>%
+  filter(Period == ANIM_PERIOD, time >= TIME_START, time <= TIME_END) %>%
+  drop_na(x, y) %>%
+  left_join(closest_def_lookup, by = "Frame") %>%
+  mutate(
+    is_closest   = replace_na(player == closest_defender & team == defending_team, FALSE),
+    pt_color     = ifelse(team == "Home", "#ef4444", "#38bdf8"),
+    # ring colour: gold for closest defender, transparent otherwise
+    ring_color   = ifelse(is_closest, "#facc15", NA_character_),
+    pt_size      = ifelse(is_closest, 7, 4.5)
+  )
+
+ball_window <- ball_data %>%
+  filter(Period == ANIM_PERIOD, time >= TIME_START, time <= TIME_END)
+
+# ── 3. STRAIN metrics window (for the right-hand panel) ──────────────────────
+#    We use the raw strain_results (frame-level) instead of the 10-s aggregates
+metrics_window <- strain_results %>%
+  filter(Period == ANIM_PERIOD, time >= TIME_START, time <= TIME_END) %>%
+  mutate(
+    velocity  = abs(closure_rate),
+    frame_idx = Frame - min(Frame)
+  ) %>%
+  select(Frame, frame_idx, time, distance_to_ball, velocity, STRAIN, defending_team) %>%
+  # Right-join to all frames in the window so every frame is represented
+  right_join(
+    all_players %>%
+      filter(Period == ANIM_PERIOD, time >= TIME_START, time <= TIME_END) %>%
+      distinct(Frame, time),
+    by = c("Frame", "time")
+  ) %>%
+  mutate(
+    # When Home is NOT the defending team, metrics are meaningless → NA
+    distance_to_ball = ifelse(defending_team == "Home" | is.na(defending_team),
+                              distance_to_ball, NA_real_),
+    velocity         = ifelse(defending_team == "Home" | is.na(defending_team),
+                              velocity, NA_real_),
+    STRAIN           = ifelse(defending_team == "Home" | is.na(defending_team),
+                              STRAIN, NA_real_)
+  ) %>%
+  arrange(time)
+
+# Shared dark theme for metric plots
+dark_theme <- theme_minimal(base_family = "mono") +
+  theme(
+    plot.background  = element_rect(fill = "#020817", color = NA),
+    panel.background = element_rect(fill = "#0c1628", color = NA),
+    panel.grid.major = element_line(color = "#1e293b", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    panel.border     = element_rect(color = "#1e293b", fill = NA, linewidth = 0.5),
+    axis.text        = element_text(color = "#64748b", size = 7),
+    axis.title       = element_text(color = "#475569", size = 8),
+    strip.text       = element_text(color = "#94a3b8", size = 8),
+    legend.position  = "none",
+    plot.margin      = margin(4, 8, 4, 8)
+  )
+
+# ── 4. Build LEFT animation (pitch) ──────────────────────────────────────────
+anim_pitch <- pitch +
+  # normal players
+  geom_point(
+    data  = players_window,
+    aes(x = x, y = y, color = pt_color, size = pt_size),
+    alpha = 0.85
+  ) +
+  # gold highlight ring for closest defender
+  geom_point(
+    data   = players_window %>% filter(is_closest),
+    aes(x  = x, y = y),
+    color  = "#facc15", fill = NA,
+    shape  = 21, size = 10, stroke = 2
+  ) +
+  # player number labels
+  geom_text(
+    data  = players_window,
+    aes(x = x, y = y, label = sub("Player", "", player)),
+    color = "white", size = 2.0, fontface = "bold"
+  ) +
+  # ball
+  geom_point(
+    data   = ball_window,
+    aes(x  = Ball_x, y = Ball_y),
+    color  = "white", size = 3.5,
+    shape  = 21, fill = "black", stroke = 2
+  ) +
+  scale_color_identity() +
+  scale_size_identity() +
+  transition_time(time) +
+  labs(
+    title    = "Time: {round(frame_time, 1)}s",
+    subtitle = "Red = Home | Blue = Away | ○ = Closest Defender"
+  ) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, size = 13, face = "bold",
+                                 color = "#f8fafc", family = "mono"),
+    plot.subtitle = element_text(hjust = 0.5, size = 9,
+                                 color = "#94a3b8", family = "mono"),
+    plot.background = element_rect(fill = "#020817", color = NA)
+  )
+
+gif_pitch <- animate(
+  anim_pitch,
+  nframes  = ANIM_DURATION * ANIM_FPS,
+  fps      = ANIM_FPS,
+  duration = ANIM_DURATION,
+  width    = 600,
+  height   = 420,
+  renderer = gifski_renderer()
+)
+
+# ── 5. Build RIGHT animation (metrics panel) ──────────────────────────────────
+#    Three stacked plots: distance / velocity / STRAIN.
+#    A vertical line slides with `transition_reveal` using `time` as the reveal var.
+
+# We need one combined tall ggplot with three facets.
+# Reshape metrics to long for faceting.
+metrics_long <- metrics_window %>%
+  pivot_longer(
+    cols      = c(distance_to_ball, velocity, STRAIN),
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+      levels = c("distance_to_ball", "velocity", "STRAIN"),
+      labels = c("Distance (m)", "Velocity (m/s)", "STRAIN")
+    )
+  )
+
+# Static background ribbon for each facet (the full trace)
+metrics_bg <- metrics_long   # full trace, drawn as static grey ribbon
+
+# For the animated "current position" dot + leading trace we use transition_reveal
+anim_metrics <- ggplot(metrics_long, aes(x = time, y = value, color = metric)) +
+  # full-trace background (light)
+  geom_line(
+    data  = metrics_bg,
+    aes(x = time, y = value),
+    color = "#1e3a5f", linewidth = 0.6, alpha = 0.6
+  ) +
+  # animated growing trace
+  geom_line(linewidth = 1, alpha = 0.9) +
+  # animated dot at front
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c(
+    "Distance (m)"       = "#38bdf8",
+    "Velocity (m/s)" = "#f97316",
+    "STRAIN"             = "#ef4444"
+  )) +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Defensive Metrics - Home",
+    x     = "Match time (s)",
+    y     = NULL
+  ) +
+  dark_theme +
+  theme(
+    strip.background = element_rect(fill = "#0f2235", color = NA),
+    plot.title       = element_text(color = "#f8fafc", size = 12,
+                                    face = "bold", margin = margin(b = 8))
+  ) +
+  transition_reveal(time)
+
+gif_metrics <- animate(
+  anim_metrics,
+  nframes  = ANIM_DURATION * ANIM_FPS,
+  fps      = ANIM_FPS,
+  duration = ANIM_DURATION,
+  width    = 420,
+  height   = 420,
+  renderer = gifski_renderer()
+)
+
+# ── 6. Stitch side-by-side with magick ───────────────────────────────────────
+tmp_pitch   <- tempfile(fileext = ".gif")
+tmp_metrics <- tempfile(fileext = ".gif")
+
+anim_save(tmp_pitch,   animation = gif_pitch)
+anim_save(tmp_metrics, animation = gif_metrics)
+
+frames_pitch   <- image_read(tmp_pitch)
+frames_metrics <- image_read(tmp_metrics)
+
+n_frames <- min(image_info(frames_pitch)$image %>% nrow(),
+                image_info(frames_metrics)$image %>% nrow())
+n_frames <- min(nrow(image_info(frames_pitch)), nrow(image_info(frames_metrics)))
+
+combined_frames <- image_join(
+  lapply(seq_len(n_frames), function(i) {
+    image_append(
+      c(frames_pitch[i], frames_metrics[i]),  # single brackets, not double
+      stack = FALSE
+    )
+  })
+)
+
+combined_gif <- image_animate(combined_frames, fps = ANIM_FPS)
+# Save and display in rendered output
+tmp_combined <- tempfile(fileext = ".gif")
+image_write(combined_gif, tmp_combined)
+knitr::include_graphics(tmp_combined)
+```
